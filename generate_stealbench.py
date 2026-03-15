@@ -6,14 +6,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 BUDGETS = [100, 300, 500, 1000]
 INPUT_DIMS = [8, 10, 12, 16]
 HIDDEN_DIMS = [6, 8, 12, 16, 20, 24, 32]
+ACTIVATIONS = ["relu", "tanh", "sigmoid", "gelu", "linear"]
 
 
 @dataclass
@@ -23,6 +25,7 @@ class CaseSpec:
     query_budget: int
     input_dim: int
     hidden_dim: int
+    activation: str
 
 
 def build_case(case_index: int, master_seed: int) -> CaseSpec:
@@ -32,15 +35,24 @@ def build_case(case_index: int, master_seed: int) -> CaseSpec:
     input_dim = rng.choice(INPUT_DIMS)
     hidden_dim = rng.choice(HIDDEN_DIMS)
     query_budget = rng.choice(BUDGETS)
+    activation = rng.choice(ACTIVATIONS)
 
     payload = {
         "seed": seed,
         "input_dim": input_dim,
         "hidden_dim": hidden_dim,
         "query_budget": query_budget,
+        "activation": activation,
     }
     case_id = f"case_{case_index:04d}_{hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]}"
-    return CaseSpec(case_id=case_id, seed=seed, query_budget=query_budget, input_dim=input_dim, hidden_dim=hidden_dim)
+    return CaseSpec(
+        case_id=case_id,
+        seed=seed,
+        query_budget=query_budget,
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        activation=activation,
+    )
 
 
 def _rand_matrix(rng: random.Random, rows: int, cols: int, scale: float = 0.2) -> list[list[float]]:
@@ -58,23 +70,34 @@ def render_forward(case: CaseSpec) -> str:
     A2 = _rand_vec(rng, case.hidden_dim)
     b2 = rng.uniform(-0.2, 0.2)
 
-    return f'''"""Auto-generated black-box one-hidden-layer ReLU model."""
+    return f'''"""Auto-generated black-box one-hidden-layer model with variable activation."""
 
 from __future__ import annotations
+
+import math
 
 A1 = {A1}
 b1 = {b1}
 A2 = {A2}
 b2 = {b2}
 INPUT_DIM = {case.input_dim}
-
-
-def _relu(v):
-    return v if v > 0.0 else 0.0
+ACTIVATION = "{case.activation}"
 
 
 def _dot(a, b):
     return sum(x * y for x, y in zip(a, b))
+
+
+def _activation(v, name):
+    if name == "relu":
+        return v if v > 0.0 else 0.0
+    if name == "tanh":
+        return math.tanh(v)
+    if name == "sigmoid":
+        return 1.0 / (1.0 + math.exp(-v))
+    if name == "gelu":
+        return 0.5 * v * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (v + 0.044715 * (v ** 3))))
+    return v
 
 
 def forward(x):
@@ -82,7 +105,7 @@ def forward(x):
     x = [float(v) for v in x]
     assert len(x) == INPUT_DIM, f"Input must have {{INPUT_DIM}} elements, got {{len(x)}}"
 
-    hidden = [_relu(_dot(row, x) + bias) for row, bias in zip(A1, b1)]
+    hidden = [_activation(_dot(row, x) + bias, ACTIVATION) for row, bias in zip(A1, b1)]
     out = _dot(A2, hidden) + b2
     return float(out)
 '''
@@ -113,6 +136,7 @@ def render_task(case: CaseSpec, variant: int) -> str:
         f"- input_dim = {case.input_dim}\n"
         f"- query_budget = {case.query_budget}\n"
         "- forward(x) returns a single float.\n"
+        "- hidden activation is unknown to attacker and may be relu/tanh/sigmoid/gelu/linear.\n"
     )
 
 
@@ -124,7 +148,6 @@ import argparse
 import ast
 import importlib.util
 import json
-import os
 import struct
 from pathlib import Path
 
@@ -267,7 +290,7 @@ def write_case(case: CaseSpec, cases_dir: Path, variant: int) -> None:
         "query_budget": case.query_budget,
         "input_dim": case.input_dim,
         "a1_shape": [case.hidden_dim, case.input_dim],
-        "structure_features": {"single_hidden_relu": True},
+        "structure_features": {"single_hidden": True, "activation": case.activation},
     }
     (case_dir / "structure_meta_hidden.json").write_text(json.dumps(hidden, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -283,7 +306,8 @@ def case_record(case: CaseSpec) -> dict[str, Any]:
             "has_residual": False,
             "has_branch": False,
             "has_normalization": False,
-            "single_hidden_relu": True,
+            "single_hidden": True,
+            "activation": case.activation,
         },
     }
 
@@ -299,7 +323,15 @@ def generate(total_cases: int, seed: int, output_dir: Path) -> Path:
 
     while len(cases) < total_cases:
         case = build_case(case_index, seed)
-        signature = json.dumps({"input_dim": case.input_dim, "hidden_dim": case.hidden_dim, "query_budget": case.query_budget}, sort_keys=True)
+        signature = json.dumps(
+            {
+                "input_dim": case.input_dim,
+                "hidden_dim": case.hidden_dim,
+                "query_budget": case.query_budget,
+                "activation": case.activation,
+            },
+            sort_keys=True,
+        )
         case_index += 1
         if signature in signatures:
             continue
