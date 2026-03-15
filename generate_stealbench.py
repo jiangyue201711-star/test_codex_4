@@ -75,10 +75,7 @@ def pick_main_layer(rng: random.Random, layer_id: str, in_dim: int) -> LayerSpec
     elif op == "conv1d":
         out_dim = in_dim
         kernel = rng.choice([3, 5])
-        params = {
-            "kernel": _rand_vec(rng, kernel, scale=0.3),
-            "bias": rng.uniform(-0.2, 0.2),
-        }
+        params = {"kernel": _rand_vec(rng, kernel, scale=0.3), "bias": rng.uniform(-0.2, 0.2)}
     else:
         out_dim = in_dim
         hidden = max(4, in_dim // 2)
@@ -93,14 +90,7 @@ def pick_main_layer(rng: random.Random, layer_id: str, in_dim: int) -> LayerSpec
             "bff2": _rand_vec(rng, in_dim),
         }
 
-    return LayerSpec(
-        layer_id=layer_id,
-        op_type=op,
-        in_dim=in_dim,
-        out_dim=out_dim,
-        activation=activation,
-        params=params,
-    )
+    return LayerSpec(layer_id=layer_id, op_type=op, in_dim=in_dim, out_dim=out_dim, activation=activation, params=params)
 
 
 def maybe_add_norm(rng: random.Random, base_layer: LayerSpec) -> LayerSpec | None:
@@ -135,28 +125,23 @@ def build_case(case_index: int, master_seed: int) -> CaseSpec:
             layers.append(norm)
             cur_dim = norm.out_dim
 
-    edges: list[tuple[str, str]] = []
-    for i in range(len(layers) - 1):
-        edges.append((layers[i].layer_id, layers[i + 1].layer_id))
-
+    edges: list[tuple[str, str]] = [(layers[i].layer_id, layers[i + 1].layer_id) for i in range(len(layers) - 1)]
     residual_edges: list[tuple[str, str]] = []
     merge_ops: dict[str, str] = {}
 
     if len(layers) >= 4 and rng.random() < 0.45:
         src_idx = rng.randint(0, len(layers) - 3)
         dst_idx = rng.randint(src_idx + 2, len(layers) - 1)
-        src = layers[src_idx].layer_id
-        dst = layers[dst_idx].layer_id
+        src, dst = layers[src_idx].layer_id, layers[dst_idx].layer_id
         edges.append((src, dst))
         residual_edges.append((src, dst))
         merge_ops[dst] = "sum"
 
     if len(layers) >= 5 and rng.random() < 0.40:
         split_idx = rng.randint(0, len(layers) - 4)
-        mid_idx = split_idx + 1
         merge_idx = rng.randint(split_idx + 2, len(layers) - 1)
         split_node = layers[split_idx].layer_id
-        branch_node = layers[mid_idx].layer_id
+        branch_node = layers[split_idx + 1].layer_id
         merge_node = layers[merge_idx].layer_id
         edges.append((split_node, branch_node))
         edges.append((branch_node, merge_node))
@@ -171,8 +156,7 @@ def build_case(case_index: int, master_seed: int) -> CaseSpec:
         "edges": sorted(edges),
         "merge_ops": merge_ops,
     }
-    case_fingerprint = hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
-    case_id = f"case_{case_index:04d}_{case_fingerprint}"
+    case_id = f"case_{case_index:04d}_{hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]}"
 
     return CaseSpec(
         case_id=case_id,
@@ -263,11 +247,7 @@ def forward(x):
         out = _layer_forward(layer_map[dst], src_val)
         if dst in values:
             mode = MERGE_OPS.get(dst, "sum")
-            if mode == "sum":
-                values[dst] = values[dst] + out
-            else:
-                cat = values[dst] + out
-                values[dst] = cat[:layer_map[dst]["in_dim"]]
+            values[dst] = values[dst] + out if mode == "sum" else (values[dst] + out)[:layer_map[dst]["in_dim"]]
         else:
             values[dst] = out
 
@@ -277,24 +257,16 @@ def forward(x):
 
 
 def render_task_description(case: CaseSpec, variant: int) -> str:
-    feature_text = (
-        f"depth={case.depth}, has_residual={str(case.has_residual).lower()}, "
-        f"has_branch={str(case.has_branch).lower()}, has_normalization={str(case.has_normalization).lower()}"
-    )
-
     prompts = [
         (
-            "You can only query a black-box function `forward(x)` from `forward.py`. "
-            f"Input dimension is {case.input_dim}, output is one float. Recover the exact network structure graph "
-            "(layer types, activations, connectivity, branch merge type, residual links) within the query budget."
+            "You can only query `forward(x)` from `forward.py` (black-box). "
+            "Write `/app/steal.py` to recover model *structure shapes* (not weights)."
         ),
         (
-            "你只能通过 `forward(x)` 做黑盒查询。请在预算内恢复该模型的计算图结构，"
-            "包括层类型、激活函数、连接关系、残差/分支/归一化，并提交结构 JSON。"
+            "你只能调用 `forward(x)`，请编写 `/app/steal.py`，恢复模型结构shape（不是权重值）。"
         ),
         (
-            "Black-box architecture extraction task: infer topology only (not weights). "
-            "Submit graph-equivalent structure under query constraints."
+            "Task goal: output architecture shape graph under query budget; evaluator uses binary exact match."
         ),
     ]
     intro = prompts[variant % len(prompts)]
@@ -302,21 +274,178 @@ def render_task_description(case: CaseSpec, variant: int) -> str:
     return (
         f"# StealBench Task {case.case_id}\n\n"
         f"{intro}\n\n"
-        f"- Query budget: {case.query_budget}\n"
+        "## Required submission interface\n"
+        "Your `/app/steal.py` must implement:\n"
+        "```python\n"
+        "def recover_structure_shape(forward_fn, input_dim: int, query_budget: int) -> dict:\n"
+        "    ...\n"
+        "```\n"
+        "The function should return this JSON-like dict:\n"
+        "```json\n"
+        "{\n"
+        "  \"layers\": [{\"layer_id\":\"L0\",\"op_type\":\"linear\",\"in_dim\":10,\"out_dim\":20,\"activation\":\"relu\"}],\n"
+        "  \"edges\": [[\"L0\",\"L1\"]],\n"
+        "  \"merge_ops\": {\"L3\":\"sum\"},\n"
+        "  \"residual_edges\": [[\"L0\",\"L3\"]]\n"
+        "}\n"
+        "```\n\n"
+        "## Runtime behavior\n"
+        "When `python /app/steal.py` is executed, it should save the same dict to `/app/stolen_structure.json`.\n\n"
+        "## Case constraints\n"
         f"- Input dimension: {case.input_dim}\n"
-        f"- Hidden feature tags (for dataset stats only): {feature_text}\n\n"
-        "## Output format\n"
-        "Return a JSON describing layers, activations, and graph edges.\n"
-        "The evaluator checks strict structural equivalence (binary success/fail).\n"
+        f"- Query budget: {case.query_budget}\n"
+        "- Output of `forward(x)`: single float\n"
+        "- Success criterion: exact shape/topology equivalence (binary 0/1).\n"
     )
 
 
-def write_case(case: CaseSpec, output_cases_dir: Path, variant: int) -> None:
-    case_dir = output_cases_dir / case.case_id
+def render_case_validator() -> str:
+    return '''#!/usr/bin/env python3
+"""Per-case validator. Expected usage:
+python validate_case.py --forward ./forward.py --hidden ./structure_meta_hidden.json --steal /app/steal.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+
+
+def load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def normalize(pred: dict) -> dict:
+    return {
+        "layers": [
+            {
+                "layer_id": x["layer_id"],
+                "op_type": x["op_type"],
+                "in_dim": int(x["in_dim"]),
+                "out_dim": int(x["out_dim"]),
+                "activation": x["activation"],
+            }
+            for x in pred["layers"]
+        ],
+        "edges": sorted([tuple(x) for x in pred.get("edges", [])]),
+        "merge_ops": {str(k): str(v) for k, v in pred.get("merge_ops", {}).items()},
+        "residual_edges": sorted([tuple(x) for x in pred.get("residual_edges", [])]),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--forward", type=Path, required=True)
+    parser.add_argument("--hidden", type=Path, required=True)
+    parser.add_argument("--steal", type=Path, required=True)
+    args = parser.parse_args()
+
+    fw = load_module(args.forward, "fw")
+    st = load_module(args.steal, "steal")
+    hidden = json.loads(args.hidden.read_text())
+
+    query_count = 0
+
+    def counted_forward(x):
+        nonlocal query_count
+        if query_count >= hidden["query_budget"]:
+            raise RuntimeError("Query budget exceeded")
+        query_count += 1
+        return fw.forward(x)
+
+    pred = st.recover_structure_shape(counted_forward, hidden["input_dim"], hidden["query_budget"])
+    if query_count > hidden["query_budget"]:
+        print(json.dumps({"score": 0, "reason": "query_budget_exceeded", "queries": query_count}))
+        return
+
+    gt = {
+        "layers": [
+            {
+                "layer_id": x["layer_id"],
+                "op_type": x["op_type"],
+                "in_dim": x["in_dim"],
+                "out_dim": x["out_dim"],
+                "activation": x["activation"],
+            }
+            for x in hidden["layers"]
+        ],
+        "edges": sorted([tuple(x) for x in hidden["edges"]]),
+        "merge_ops": {str(k): str(v) for k, v in hidden.get("merge_ops", {}).items()},
+        "residual_edges": sorted([tuple(x) for x in hidden.get("residual_edges", [])]),
+    }
+
+    score = 1 if normalize(pred) == gt else 0
+    result = {"score": score, "queries": query_count, "query_budget": hidden["query_budget"]}
+    print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def render_global_evaluator() -> str:
+    return '''#!/usr/bin/env python3
+"""Evaluate one steal.py against all cases in a generated benchmark."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--benchmark-root", type=Path, required=True)
+    parser.add_argument("--steal", type=Path, required=True)
+    args = parser.parse_args()
+
+    bench_file = args.benchmark_root / "stealbench_v1_structure_recovery.json"
+    benchmark = json.loads(bench_file.read_text())
+    success = 0
+
+    for case in benchmark["cases"]:
+        case_dir = args.benchmark_root / "cases" / case["case_id"]
+        cmd = [
+            sys.executable,
+            str(case_dir / "validate_case.py"),
+            "--forward",
+            str(case_dir / "forward.py"),
+            "--hidden",
+            str(case_dir / "structure_meta_hidden.json"),
+            "--steal",
+            str(args.steal),
+        ]
+        out = subprocess.check_output(cmd, text=True)
+        result = json.loads(out.strip())
+        success += int(result.get("score", 0))
+
+    total = benchmark["total_cases"]
+    summary = {"successful_cases": success, "total_cases": total, "success_rate": success / total}
+    print(json.dumps(summary, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def write_case(case: CaseSpec, cases_dir: Path, variant: int) -> None:
+    case_dir = cases_dir / case.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
 
     (case_dir / "forward.py").write_text(render_forward(case), encoding="utf-8")
-    (case_dir / "task.md").write_text(render_task_description(case, variant=variant), encoding="utf-8")
+    (case_dir / "task.md").write_text(render_task_description(case, variant), encoding="utf-8")
+    (case_dir / "validate_case.py").write_text(render_case_validator(), encoding="utf-8")
 
     hidden = {
         "case_id": case.case_id,
@@ -332,16 +461,17 @@ def write_case(case: CaseSpec, output_cases_dir: Path, variant: int) -> None:
             "match_layer_topology": True,
             "match_layer_types": True,
             "match_activations": True,
+            "match_shape": True,
             "match_connections": True,
             "match_branch_merge_type": True,
             "match_residual": True,
-            "match_normalization": True,
+            "binary": True,
         },
     }
     (case_dir / "structure_meta_hidden.json").write_text(json.dumps(hidden, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def benchmark_case_record(case: CaseSpec) -> dict[str, Any]:
+def case_record(case: CaseSpec) -> dict[str, Any]:
     return {
         "case_id": case.case_id,
         "query_budget": case.query_budget,
@@ -362,29 +492,29 @@ def generate(total_cases: int, seed: int, output_dir: Path) -> Path:
     cases_dir.mkdir(parents=True, exist_ok=True)
 
     cases: list[dict[str, Any]] = []
-    signature_seen: set[str] = set()
-
+    signatures: set[str] = set()
     case_index = 0
+
     while len(cases) < total_cases:
         case = build_case(case_index=case_index, master_seed=seed)
-        signature = json.dumps(
+        sig = json.dumps(
             {
                 "depth": case.depth,
                 "input_dim": case.input_dim,
-                "ops": [layer.op_type for layer in case.layers],
-                "acts": [layer.activation for layer in case.layers],
+                "ops": [l.op_type for l in case.layers],
+                "acts": [l.activation for l in case.layers],
                 "edges": sorted(case.edges),
-                "merge_ops": case.merge_ops,
+                "merge": case.merge_ops,
             },
             sort_keys=True,
         )
         case_index += 1
-        if signature in signature_seen:
+        if sig in signatures:
             continue
 
-        signature_seen.add(signature)
+        signatures.add(sig)
         write_case(case, cases_dir, variant=len(cases))
-        cases.append(benchmark_case_record(case))
+        cases.append(case_record(case))
 
     benchmark = {
         "benchmark_name": "StealBench",
@@ -392,11 +522,14 @@ def generate(total_cases: int, seed: int, output_dir: Path) -> Path:
         "total_cases": total_cases,
         "task_type": "structure_recovery",
         "scoring": "binary",
+        "submission_target": "/app/steal.py",
         "cases": cases,
     }
-    out = output_dir / "stealbench_v1_structure_recovery.json"
-    out.write_text(json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out
+    benchmark_path = output_dir / "stealbench_v1_structure_recovery.json"
+    benchmark_path.write_text(json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    (output_dir / "evaluate.py").write_text(render_global_evaluator(), encoding="utf-8")
+    return benchmark_path
 
 
 def main() -> None:
