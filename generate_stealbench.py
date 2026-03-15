@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StealBench v1: automatic structure-recovery benchmark generator."""
+"""Generate a simplified StealBench v1 structure-shape benchmark."""
 
 from __future__ import annotations
 
@@ -11,22 +11,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-ACTIVATIONS = ["relu", "tanh", "sigmoid", "gelu", "none"]
-MAIN_LAYER_TYPES = ["linear", "conv1d", "attention_like"]
-NORM_TYPES = ["layernorm"]
-MERGE_TYPES = ["sum", "concat"]
 BUDGETS = [100, 300, 500, 1000]
 INPUT_DIMS = [8, 10, 12, 16]
-
-
-@dataclass
-class LayerSpec:
-    layer_id: str
-    op_type: str
-    in_dim: int
-    out_dim: int
-    activation: str
-    params: dict[str, Any]
+HIDDEN_DIMS = [6, 8, 12, 16, 20, 24, 32]
 
 
 @dataclass
@@ -34,27 +21,26 @@ class CaseSpec:
     case_id: str
     seed: int
     query_budget: int
-    depth: int
     input_dim: int
-    layers: list[LayerSpec]
-    edges: list[tuple[str, str]]
-    merge_ops: dict[str, str]
-    residual_edges: list[tuple[str, str]]
+    hidden_dim: int
 
-    @property
-    def has_residual(self) -> bool:
-        return len(self.residual_edges) > 0
 
-    @property
-    def has_normalization(self) -> bool:
-        return any("norm" in layer.op_type for layer in self.layers)
+def build_case(case_index: int, master_seed: int) -> CaseSpec:
+    seed = master_seed + case_index * 9973
+    rng = random.Random(seed)
 
-    @property
-    def has_branch(self) -> bool:
-        indeg: dict[str, int] = {}
-        for _src, dst in self.edges:
-            indeg[dst] = indeg.get(dst, 0) + 1
-        return any(v >= 2 for v in indeg.values())
+    input_dim = rng.choice(INPUT_DIMS)
+    hidden_dim = rng.choice(HIDDEN_DIMS)
+    query_budget = rng.choice(BUDGETS)
+
+    payload = {
+        "seed": seed,
+        "input_dim": input_dim,
+        "hidden_dim": hidden_dim,
+        "query_budget": query_budget,
+    }
+    case_id = f"case_{case_index:04d}_{hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]}"
+    return CaseSpec(case_id=case_id, seed=seed, query_budget=query_budget, input_dim=input_dim, hidden_dim=hidden_dim)
 
 
 def _rand_matrix(rng: random.Random, rows: int, cols: int, scale: float = 0.2) -> list[list[float]]:
@@ -65,251 +51,81 @@ def _rand_vec(rng: random.Random, n: int, scale: float = 0.2) -> list[float]:
     return [rng.uniform(-scale, scale) for _ in range(n)]
 
 
-def pick_main_layer(rng: random.Random, layer_id: str, in_dim: int) -> LayerSpec:
-    op = rng.choice(MAIN_LAYER_TYPES)
-    activation = rng.choice(ACTIVATIONS)
-
-    if op == "linear":
-        out_dim = rng.choice([8, 12, 16, 20, 24])
-        params = {"W": _rand_matrix(rng, out_dim, in_dim), "b": _rand_vec(rng, out_dim)}
-    elif op == "conv1d":
-        out_dim = in_dim
-        kernel = rng.choice([3, 5])
-        params = {"kernel": _rand_vec(rng, kernel, scale=0.3), "bias": rng.uniform(-0.2, 0.2)}
-    else:
-        out_dim = in_dim
-        hidden = max(4, in_dim // 2)
-        params = {
-            "Wq": _rand_matrix(rng, in_dim, in_dim),
-            "Wk": _rand_matrix(rng, in_dim, in_dim),
-            "Wv": _rand_matrix(rng, in_dim, in_dim),
-            "Wo": _rand_matrix(rng, in_dim, in_dim),
-            "Wff1": _rand_matrix(rng, hidden, in_dim),
-            "bff1": _rand_vec(rng, hidden),
-            "Wff2": _rand_matrix(rng, in_dim, hidden),
-            "bff2": _rand_vec(rng, in_dim),
-        }
-
-    return LayerSpec(layer_id=layer_id, op_type=op, in_dim=in_dim, out_dim=out_dim, activation=activation, params=params)
-
-
-def maybe_add_norm(rng: random.Random, base_layer: LayerSpec) -> LayerSpec | None:
-    if rng.random() > 0.30:
-        return None
-    return LayerSpec(
-        layer_id=f"N{base_layer.layer_id[1:]}",
-        op_type=rng.choice(NORM_TYPES),
-        in_dim=base_layer.out_dim,
-        out_dim=base_layer.out_dim,
-        activation="none",
-        params={"eps": 1e-5},
-    )
-
-
-def build_case(case_index: int, master_seed: int) -> CaseSpec:
-    seed = master_seed + case_index * 10007
-    rng = random.Random(seed)
-
-    depth = rng.randint(2, 8)
-    query_budget = rng.choice(BUDGETS)
-    input_dim = rng.choice(INPUT_DIMS)
-
-    layers: list[LayerSpec] = []
-    cur_dim = input_dim
-    for idx in range(depth):
-        main = pick_main_layer(rng, f"L{idx}", cur_dim)
-        layers.append(main)
-        cur_dim = main.out_dim
-        norm = maybe_add_norm(rng, main)
-        if norm is not None:
-            layers.append(norm)
-            cur_dim = norm.out_dim
-
-    edges: list[tuple[str, str]] = [(layers[i].layer_id, layers[i + 1].layer_id) for i in range(len(layers) - 1)]
-    residual_edges: list[tuple[str, str]] = []
-    merge_ops: dict[str, str] = {}
-
-    if len(layers) >= 4 and rng.random() < 0.45:
-        src_idx = rng.randint(0, len(layers) - 3)
-        dst_idx = rng.randint(src_idx + 2, len(layers) - 1)
-        src, dst = layers[src_idx].layer_id, layers[dst_idx].layer_id
-        edges.append((src, dst))
-        residual_edges.append((src, dst))
-        merge_ops[dst] = "sum"
-
-    if len(layers) >= 5 and rng.random() < 0.40:
-        split_idx = rng.randint(0, len(layers) - 4)
-        merge_idx = rng.randint(split_idx + 2, len(layers) - 1)
-        split_node = layers[split_idx].layer_id
-        branch_node = layers[split_idx + 1].layer_id
-        merge_node = layers[merge_idx].layer_id
-        edges.append((split_node, branch_node))
-        edges.append((branch_node, merge_node))
-        merge_ops[merge_node] = rng.choice(MERGE_TYPES)
-
-    payload = {
-        "seed": seed,
-        "depth": depth,
-        "query_budget": query_budget,
-        "input_dim": input_dim,
-        "layers": [asdict(layer) for layer in layers],
-        "edges": sorted(edges),
-        "merge_ops": merge_ops,
-    }
-    case_id = f"case_{case_index:04d}_{hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]}"
-
-    return CaseSpec(
-        case_id=case_id,
-        seed=seed,
-        query_budget=query_budget,
-        depth=depth,
-        input_dim=input_dim,
-        layers=layers,
-        edges=edges,
-        merge_ops=merge_ops,
-        residual_edges=residual_edges,
-    )
-
-
 def render_forward(case: CaseSpec) -> str:
-    layer_dict = [asdict(layer) for layer in case.layers]
-    return f'''import math
+    rng = random.Random(case.seed)
+    A1 = _rand_matrix(rng, case.hidden_dim, case.input_dim)
+    b1 = _rand_vec(rng, case.hidden_dim)
+    A2 = _rand_vec(rng, case.hidden_dim)
+    b2 = rng.uniform(-0.2, 0.2)
 
-CASE_ID = "{case.case_id}"
+    return f'''"""Auto-generated black-box one-hidden-layer ReLU model."""
+
+from __future__ import annotations
+
+A1 = {A1}
+b1 = {b1}
+A2 = {A2}
+b2 = {b2}
 INPUT_DIM = {case.input_dim}
-LAYERS = {json.dumps(layer_dict, ensure_ascii=False, indent=2)}
-EDGES = {repr(case.edges)}
-MERGE_OPS = {repr(case.merge_ops)}
 
 
-def _activation(x, name):
-    if name == "relu":
-        return [max(0.0, v) for v in x]
-    if name == "tanh":
-        return [math.tanh(v) for v in x]
-    if name == "sigmoid":
-        return [1.0 / (1.0 + math.exp(-v)) for v in x]
-    if name == "gelu":
-        return [0.5 * v * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (v + 0.044715 * (v ** 3)))) for v in x]
-    return x
-
-
-def _matvec(mat, vec):
-    return [sum(a * b for a, b in zip(row, vec)) for row in mat]
+def _relu(v):
+    return v if v > 0.0 else 0.0
 
 
 def _dot(a, b):
     return sum(x * y for x, y in zip(a, b))
 
 
-def _layer_forward(layer, x):
-    op = layer["op_type"]
-    p = layer["params"]
-    if op == "linear":
-        y = [u + v for u, v in zip(_matvec(p["W"], x), p["b"])]
-    elif op == "conv1d":
-        k = p["kernel"]
-        pad = len(k) // 2
-        xpad = [0.0] * pad + x + [0.0] * pad
-        y = [_dot(xpad[i:i + len(k)], k) + float(p["bias"]) for i in range(len(x))]
-    elif op == "attention_like":
-        q = _matvec(p["Wq"], x)
-        k = _matvec(p["Wk"], x)
-        v = _matvec(p["Wv"], x)
-        score = _dot(q, k) / math.sqrt(max(1, len(x)))
-        att = 1.0 / (1.0 + math.exp(-score))
-        ctx = [att * vv for vv in v]
-        h = _matvec(p["Wo"], ctx)
-        ff1 = [u + v for u, v in zip(_matvec(p["Wff1"], h), p["bff1"])]
-        ff1 = [max(0.0, u) for u in ff1]
-        y = [u + v for u, v in zip(_matvec(p["Wff2"], ff1), p["bff2"])]
-    elif op == "layernorm":
-        eps = float(p.get("eps", 1e-5))
-        mu = sum(x) / len(x)
-        var = sum((v - mu) ** 2 for v in x) / len(x)
-        y = [(v - mu) / math.sqrt(var + eps) for v in x]
-    else:
-        raise ValueError(f"Unsupported op: {{op}}")
-    return _activation(y, layer["activation"])
-
-
 def forward(x):
+    """Black-box API: input vector -> scalar output."""
     x = [float(v) for v in x]
     assert len(x) == INPUT_DIM, f"Input must have {{INPUT_DIM}} elements, got {{len(x)}}"
 
-    layer_map = {{layer["layer_id"]: layer for layer in LAYERS}}
-    values = {{LAYERS[0]["layer_id"]: x}}
-
-    for src, dst in EDGES:
-        src_val = values.get(src)
-        if src_val is None:
-            continue
-        out = _layer_forward(layer_map[dst], src_val)
-        if dst in values:
-            mode = MERGE_OPS.get(dst, "sum")
-            values[dst] = values[dst] + out if mode == "sum" else (values[dst] + out)[:layer_map[dst]["in_dim"]]
-        else:
-            values[dst] = out
-
-    tail = values[LAYERS[-1]["layer_id"]]
-    return float(sum(tail) / len(tail))
+    hidden = [_relu(_dot(row, x) + bias) for row, bias in zip(A1, b1)]
+    out = _dot(A2, hidden) + b2
+    return float(out)
 '''
 
 
-def render_task_description(case: CaseSpec, variant: int) -> str:
+def render_task(case: CaseSpec, variant: int) -> str:
     prompts = [
-        (
-            "You can only query `forward(x)` from `forward.py` (black-box). "
-            "Write `/app/steal.py` to recover model *structure shapes* (not weights)."
-        ),
-        (
-            "你只能调用 `forward(x)`，请编写 `/app/steal.py`，恢复模型结构shape（不是权重值）。"
-        ),
-        (
-            "Task goal: output architecture shape graph under query budget; evaluator uses binary exact match."
-        ),
+        "You can only query `forward(x)`. Recover A1 shape and save matrix to `/app/stolen_A1.npy`.",
+        "你只能访问黑盒 `forward(x)`，请恢复 A1 的结构shape，并把矩阵保存到 `/app/stolen_A1.npy`。",
+        "Black-box extraction task: produce `stolen_A1.npy` whose matrix shape matches hidden A1.",
     ]
     intro = prompts[variant % len(prompts)]
 
     return (
         f"# StealBench Task {case.case_id}\n\n"
         f"{intro}\n\n"
-        "## Required submission interface\n"
-        "Your `/app/steal.py` must implement:\n"
+        "## Submission target\n"
+        "Implement `/app/steal.py` with:\n"
         "```python\n"
-        "def recover_structure_shape(forward_fn, input_dim: int, query_budget: int) -> dict:\n"
+        "def recover_A1(forward_fn, input_dim: int, query_budget: int, output_path: str = '/app/stolen_A1.npy') -> None:\n"
         "    ...\n"
-        "```\n"
-        "The function should return this JSON-like dict:\n"
-        "```json\n"
-        "{\n"
-        "  \"layers\": [{\"layer_id\":\"L0\",\"op_type\":\"linear\",\"in_dim\":10,\"out_dim\":20,\"activation\":\"relu\"}],\n"
-        "  \"edges\": [[\"L0\",\"L1\"]],\n"
-        "  \"merge_ops\": {\"L3\":\"sum\"},\n"
-        "  \"residual_edges\": [[\"L0\",\"L3\"]]\n"
-        "}\n"
         "```\n\n"
-        "## Runtime behavior\n"
-        "When `python /app/steal.py` is executed, it should save the same dict to `/app/stolen_structure.json`.\n\n"
-        "## Case constraints\n"
-        f"- Input dimension: {case.input_dim}\n"
-        f"- Query budget: {case.query_budget}\n"
-        "- Output of `forward(x)`: single float\n"
-        "- Success criterion: exact shape/topology equivalence (binary 0/1).\n"
+        "Function behavior:\n"
+        "- Use black-box queries to infer hidden-layer shape.\n"
+        "- Save a matrix to `/app/stolen_A1.npy`.\n"
+        "- Matrix values can be arbitrary; evaluator checks shape only.\n\n"
+        "## Constraints\n"
+        f"- input_dim = {case.input_dim}\n"
+        f"- query_budget = {case.query_budget}\n"
+        "- forward(x) returns a single float.\n"
     )
 
 
 def render_case_validator() -> str:
     return '''#!/usr/bin/env python3
-"""Per-case validator. Expected usage:
-python validate_case.py --forward ./forward.py --hidden ./structure_meta_hidden.json --steal /app/steal.py
-"""
-
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import json
+import os
+import struct
 from pathlib import Path
 
 
@@ -321,25 +137,25 @@ def load_module(path: Path, name: str):
     return mod
 
 
-def normalize(pred: dict) -> dict:
-    return {
-        "layers": [
-            {
-                "layer_id": x["layer_id"],
-                "op_type": x["op_type"],
-                "in_dim": int(x["in_dim"]),
-                "out_dim": int(x["out_dim"]),
-                "activation": x["activation"],
-            }
-            for x in pred["layers"]
-        ],
-        "edges": sorted([tuple(x) for x in pred.get("edges", [])]),
-        "merge_ops": {str(k): str(v) for k, v in pred.get("merge_ops", {}).items()},
-        "residual_edges": sorted([tuple(x) for x in pred.get("residual_edges", [])]),
-    }
+def read_npy_shape(path: Path) -> tuple[int, ...]:
+    with path.open("rb") as f:
+        magic = f.read(6)
+        if magic != b"\\x93NUMPY":
+            raise ValueError("Not a .npy file")
+        major = f.read(1)[0]
+        _minor = f.read(1)[0]
+        if major == 1:
+            hlen = struct.unpack("<H", f.read(2))[0]
+        elif major in (2, 3):
+            hlen = struct.unpack("<I", f.read(4))[0]
+        else:
+            raise ValueError("Unsupported npy version")
+        header = f.read(hlen).decode("latin1")
+        meta = ast.literal_eval(header)
+        return tuple(int(x) for x in meta["shape"])
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--forward", type=Path, required=True)
     parser.add_argument("--hidden", type=Path, required=True)
@@ -348,7 +164,11 @@ def main():
 
     fw = load_module(args.forward, "fw")
     st = load_module(args.steal, "steal")
-    hidden = json.loads(args.hidden.read_text())
+    hidden = json.loads(args.hidden.read_text(encoding="utf-8"))
+
+    output_path = Path("/tmp/stolen_A1.npy")
+    if output_path.exists():
+        output_path.unlink()
 
     query_count = 0
 
@@ -359,30 +179,28 @@ def main():
         query_count += 1
         return fw.forward(x)
 
-    pred = st.recover_structure_shape(counted_forward, hidden["input_dim"], hidden["query_budget"])
-    if query_count > hidden["query_budget"]:
-        print(json.dumps({"score": 0, "reason": "query_budget_exceeded", "queries": query_count}))
+    st.recover_A1(counted_forward, int(hidden["input_dim"]), int(hidden["query_budget"]), str(output_path))
+
+    if not output_path.exists():
+        print(json.dumps({"score": 0, "reason": "missing_output", "queries": query_count}))
         return
 
-    gt = {
-        "layers": [
-            {
-                "layer_id": x["layer_id"],
-                "op_type": x["op_type"],
-                "in_dim": x["in_dim"],
-                "out_dim": x["out_dim"],
-                "activation": x["activation"],
-            }
-            for x in hidden["layers"]
-        ],
-        "edges": sorted([tuple(x) for x in hidden["edges"]]),
-        "merge_ops": {str(k): str(v) for k, v in hidden.get("merge_ops", {}).items()},
-        "residual_edges": sorted([tuple(x) for x in hidden.get("residual_edges", [])]),
-    }
+    pred_shape = read_npy_shape(output_path)
+    gt_shape = tuple(hidden["a1_shape"])
+    score = 1 if pred_shape == gt_shape and query_count <= hidden["query_budget"] else 0
 
-    score = 1 if normalize(pred) == gt else 0
-    result = {"score": score, "queries": query_count, "query_budget": hidden["query_budget"]}
-    print(json.dumps(result, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "score": score,
+                "queries": query_count,
+                "query_budget": hidden["query_budget"],
+                "pred_shape": list(pred_shape),
+                "gt_shape": list(gt_shape),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
@@ -392,8 +210,6 @@ if __name__ == "__main__":
 
 def render_global_evaluator() -> str:
     return '''#!/usr/bin/env python3
-"""Evaluate one steal.py against all cases in a generated benchmark."""
-
 from __future__ import annotations
 
 import argparse
@@ -403,14 +219,13 @@ import sys
 from pathlib import Path
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark-root", type=Path, required=True)
     parser.add_argument("--steal", type=Path, required=True)
     args = parser.parse_args()
 
-    bench_file = args.benchmark_root / "stealbench_v1_structure_recovery.json"
-    benchmark = json.loads(bench_file.read_text())
+    benchmark = json.loads((args.benchmark_root / "stealbench_v1_structure_recovery.json").read_text(encoding="utf-8"))
     success = 0
 
     for case in benchmark["cases"]:
@@ -429,9 +244,8 @@ def main():
         result = json.loads(out.strip())
         success += int(result.get("score", 0))
 
-    total = benchmark["total_cases"]
-    summary = {"successful_cases": success, "total_cases": total, "success_rate": success / total}
-    print(json.dumps(summary, ensure_ascii=False))
+    total = int(benchmark["total_cases"])
+    print(json.dumps({"successful_cases": success, "total_cases": total, "success_rate": success / total}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -444,29 +258,16 @@ def write_case(case: CaseSpec, cases_dir: Path, variant: int) -> None:
     case_dir.mkdir(parents=True, exist_ok=True)
 
     (case_dir / "forward.py").write_text(render_forward(case), encoding="utf-8")
-    (case_dir / "task.md").write_text(render_task_description(case, variant), encoding="utf-8")
+    (case_dir / "task.md").write_text(render_task(case, variant), encoding="utf-8")
     (case_dir / "validate_case.py").write_text(render_case_validator(), encoding="utf-8")
 
     hidden = {
         "case_id": case.case_id,
         "seed": case.seed,
         "query_budget": case.query_budget,
-        "depth": case.depth,
         "input_dim": case.input_dim,
-        "layers": [asdict(layer) for layer in case.layers],
-        "edges": case.edges,
-        "merge_ops": case.merge_ops,
-        "residual_edges": case.residual_edges,
-        "equivalence": {
-            "match_layer_topology": True,
-            "match_layer_types": True,
-            "match_activations": True,
-            "match_shape": True,
-            "match_connections": True,
-            "match_branch_merge_type": True,
-            "match_residual": True,
-            "binary": True,
-        },
+        "a1_shape": [case.hidden_dim, case.input_dim],
+        "structure_features": {"single_hidden_relu": True},
     }
     (case_dir / "structure_meta_hidden.json").write_text(json.dumps(hidden, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -475,13 +276,14 @@ def case_record(case: CaseSpec) -> dict[str, Any]:
     return {
         "case_id": case.case_id,
         "query_budget": case.query_budget,
-        "depth": case.depth,
+        "depth": 2,
         "input_dim": case.input_dim,
         "task_file": f"cases/{case.case_id}/task.md",
         "structure_features": {
-            "has_residual": case.has_residual,
-            "has_branch": case.has_branch,
-            "has_normalization": case.has_normalization,
+            "has_residual": False,
+            "has_branch": False,
+            "has_normalization": False,
+            "single_hidden_relu": True,
         },
     }
 
@@ -496,23 +298,13 @@ def generate(total_cases: int, seed: int, output_dir: Path) -> Path:
     case_index = 0
 
     while len(cases) < total_cases:
-        case = build_case(case_index=case_index, master_seed=seed)
-        sig = json.dumps(
-            {
-                "depth": case.depth,
-                "input_dim": case.input_dim,
-                "ops": [l.op_type for l in case.layers],
-                "acts": [l.activation for l in case.layers],
-                "edges": sorted(case.edges),
-                "merge": case.merge_ops,
-            },
-            sort_keys=True,
-        )
+        case = build_case(case_index, seed)
+        signature = json.dumps({"input_dim": case.input_dim, "hidden_dim": case.hidden_dim, "query_budget": case.query_budget}, sort_keys=True)
         case_index += 1
-        if sig in signatures:
+        if signature in signatures:
             continue
+        signatures.add(signature)
 
-        signatures.add(sig)
         write_case(case, cases_dir, variant=len(cases))
         cases.append(case_record(case))
 
@@ -523,24 +315,24 @@ def generate(total_cases: int, seed: int, output_dir: Path) -> Path:
         "task_type": "structure_recovery",
         "scoring": "binary",
         "submission_target": "/app/steal.py",
+        "submission_output": "/app/stolen_A1.npy",
         "cases": cases,
     }
-    benchmark_path = output_dir / "stealbench_v1_structure_recovery.json"
-    benchmark_path.write_text(json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8")
-
+    out = output_dir / "stealbench_v1_structure_recovery.json"
+    out.write_text(json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "evaluate.py").write_text(render_global_evaluator(), encoding="utf-8")
-    return benchmark_path
+    return out
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate StealBench v1 benchmark")
+    parser = argparse.ArgumentParser(description="Generate simplified StealBench v1 benchmark")
     parser.add_argument("--total-cases", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=202601)
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/stealbench_v1"))
     args = parser.parse_args()
 
-    output = generate(total_cases=args.total_cases, seed=args.seed, output_dir=args.output_dir)
-    print(f"Generated benchmark at: {output}")
+    path = generate(args.total_cases, args.seed, args.output_dir)
+    print(f"Generated benchmark at: {path}")
 
 
 if __name__ == "__main__":
